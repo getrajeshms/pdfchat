@@ -1,0 +1,5 @@
+streamlit>=1.36
+pypdf>=4.0
+fastembed>=0.3
+numpy
+openai>=1.30
