@@ -3,3 +3,4 @@ __pycache__/
 .env
 *.pdf
 faiss_index/
+.index_cache/
