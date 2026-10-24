@@ -3,7 +3,9 @@ Zero-cost PDF chat (RAG)
 ------------------------
 - Text extraction: pypdf (free, local)
 - Embeddings:      fastembed + BAAI/bge-small-en-v1.5 (free, local, CPU, no PyTorch)
-- Vector search:   NumPy cosine similarity (no vector DB needed for a few thousand chunks)
+- Retrieval:       LLM query rewriting + hybrid search (vector + BM25 with stemming,
+                   merged with Reciprocal Rank Fusion) + abstract for whole-paper questions
+                   (see retrieval.py)
 - Answering:       any OpenAI-compatible endpoint -> Ollama (local, free),
                    Groq or Gemini (free tiers), or "No LLM" (search only, $0)
 
@@ -17,6 +19,8 @@ import re
 import numpy as np
 import streamlit as st
 from pypdf import PdfReader
+
+from retrieval import build_bm25, hybrid_search, rewrite_query
 
 # ----------------------------- settings ------------------------------------
 EMBED_MODEL = "BAAI/bge-small-en-v1.5"  # 384-dim, small, strong for its size
@@ -40,7 +44,7 @@ PROVIDERS = {
     },
     "Gemini (free tier)": {
         "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
-        "model": "gemini-2.5-flash",
+        "model": "gemini-3.8-flash",
         "needs_key": True,
     },
     "No LLM (search only, $0)": None,
@@ -108,19 +112,23 @@ def build_index(key: str, _files):
                 records.append({"file": name, "page": page_no, "text": chunk})
 
     if not records:
-        return [], np.zeros((0, 384), dtype=np.float32)
+        return [], np.zeros((0, 384), dtype=np.float32), build_bm25([])
 
     embedder = get_embedder()
-    vecs = np.array(list(embedder.passage_embed([r["text"] for r in records])), dtype=np.float32)
-    return records, normalize(vecs)
+    texts = [r["text"] for r in records]
+    vecs = np.array(list(embedder.passage_embed(texts)), dtype=np.float32)
+    return records, normalize(vecs), build_bm25(texts)
 
 
 # ----------------------------- retrieval -----------------------------------
-def search(query: str, records, vecs, k: int):
-    q = np.array(next(iter(get_embedder().query_embed([query]))), dtype=np.float32)
-    scores = vecs @ normalize(q)
-    top = np.argsort(-scores)[:k]
-    return [{**records[i], "score": float(scores[i])} for i in top]
+def embed_query(query: str) -> np.ndarray:
+    return normalize(np.array(next(iter(get_embedder().query_embed([query]))), dtype=np.float32))
+
+
+def make_client(provider, api_key):
+    from openai import OpenAI
+
+    return OpenAI(base_url=provider["base_url"], api_key=api_key or "ollama")
 
 
 def build_context(hits) -> str:
@@ -130,10 +138,7 @@ def build_context(hits) -> str:
 
 
 # ----------------------------- generation ----------------------------------
-def stream_answer(provider, model, api_key, question, hits, history):
-    from openai import OpenAI
-
-    client = OpenAI(base_url=provider["base_url"], api_key=api_key or "ollama")
+def stream_answer(client, model, question, hits, history):
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     messages += [{"role": m["role"], "content": m["content"]} for m in history[-HISTORY_TURNS:]]
     messages.append(
@@ -152,7 +157,10 @@ def stream_answer(provider, model, api_key, question, hits, history):
 def show_sources(sources):
     with st.expander(f"Sources ({len(sources)})"):
         for n, s in enumerate(sources, start=1):
-            st.markdown(f"**[{n}] {s['file']}, page {s['page']}** · relevance {s['score']:.2f}")
+            st.markdown(
+                f"**[{n}] {s['file']}, page {s['page']}** · "
+                f"semantic {s['score']:.2f} · keyword {s.get('keyword', 0):.1f}"
+            )
             st.text(s["text"])  # st.text: shown as plain text, no HTML/markdown injection
 
 
@@ -190,7 +198,7 @@ def main():
     ).hexdigest()
 
     with st.spinner("Indexing PDFs (only happens once per set of files)..."):
-        records, vecs = build_index(key, files)
+        records, vecs, bm25 = build_index(key, files)
 
     if not records:
         st.error("No text found. Scanned/image PDFs need OCR first (e.g. `ocrmypdf in.pdf out.pdf`).")
@@ -214,7 +222,14 @@ def main():
         st.markdown(question)
 
     with st.chat_message("assistant"):
-        hits = search(question, records, vecs, top_k)
+        llm_ready = provider is not None and (api_key or not provider["needs_key"])
+        client = make_client(provider, api_key) if llm_ready else None
+
+        with st.spinner("Searching your PDFs..."):
+            plan = rewrite_query(client, model, question, history)
+            hits = hybrid_search(question, plan, records, vecs, bm25, embed_query, k=top_k)
+        if plan["rewritten"] and plan["query"] != question:
+            st.caption(f"🔎 Searched for: *{plan['query']}*")
 
         if provider is None:
             answer = "Search-only mode: here are the most relevant passages. Open **Sources** below."
@@ -225,7 +240,7 @@ def main():
         else:
             try:
                 answer = st.write_stream(
-                    stream_answer(provider, model, api_key, question, hits, history)
+                    stream_answer(client, model, question, hits, history)
                 )
             except Exception as e:  # network, bad key, model not pulled, rate limit...
                 hint = " Is Ollama running, and did you `ollama pull` the model?" if not provider["needs_key"] else ""

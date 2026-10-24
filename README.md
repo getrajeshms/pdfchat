@@ -46,9 +46,16 @@ Push `app.py` and `requirements.txt` to GitHub and deploy on Streamlit Community
 - `Passages to retrieve` slider: more passages give better recall but use more tokens.
 - Scanned PDFs have no text layer. Run `ocrmypdf in.pdf out.pdf` (free) first.
 
+## How retrieval works (`retrieval.py`)
+
+1. **Query rewriting**: the LLM turns the question (plus recent chat) into a standalone query with synonyms, e.g. "objective of this paper" becomes "primary objectives and hypotheses of this study". If the LLM is unavailable, the original question is used.
+2. **Hybrid search**: vector search (BGE) plus BM25 keyword search with light stemming ("objective" matches "objectives"), merged with Reciprocal Rank Fusion. Each retriever's best hit is always kept.
+3. **Whole-paper questions** (aim, objective, summary, conclusion) also get the first page (title and abstract) of each file.
+
+Each source shows a semantic score and a keyword score, which helps debug why a passage was retrieved.
+
 ## When to upgrade (still free)
 
 - **More than ~50k chunks**: replace the NumPy search with `faiss-cpu` or `chromadb`.
-- **Exact terms (IDs, codes, names)**: add BM25 keyword search (`rank-bm25`) and merge it with vector results (hybrid search).
 - **Better ranking**: re-rank the top 20 results with a small local cross-encoder (fastembed has rerankers).
 - **Index persistence across restarts**: save `records` and `vecs` with `np.save` or JSON.

@@ -1,7 +1,5 @@
-streamlit>=1.36
-pymupdf>=1.24.3
+streamlit>=1.46
 pypdf>=4.0
-fonttools
-fastembed>=0.3
+fastembed>=0.4
 numpy
-openai>=1.30
+openai>=1.40
